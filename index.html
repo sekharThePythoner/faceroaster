@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="hi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Face Roast — demo</title>
+  <style>
+    :root{--bg:#0b0b0f;--accent:#7af;}
+    body{margin:0;height:100vh;background:linear-gradient(180deg,#071029,#0b0b0f);display:flex;align-items:center;justify-content:center;color:#fff;font-family:Inter,system-ui,Arial}
+    #wrap{position:relative;width:90vw;max-width:900px;aspect-ratio:16/9;border-radius:12px;overflow:hidden;box-shadow:0 10px 40px rgba(0,0,0,.6)}
+    video#cam{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)} /* mirror so it feels natural */
+    canvas#overlay{position:absolute;inset:0;pointer-events:none}
+    .label{
+      position:absolute;left:50%;transform:translateX(-50%);bottom:16px;background:linear-gradient(90deg,rgba(255,255,255,.06),rgba(255,255,255,.03));
+      padding:10px 16px;border-radius:999px;font-weight:700;font-size:18px;backdrop-filter:blur(6px);
+      display:flex;gap:10px;align-items:center;opacity:0;transition:all .28s cubic-bezier(.2,.9,.25,1);
+      box-shadow:0 6px 20px rgba(0,0,0,.6)
+    }
+    .label.show{opacity:1;transform:translateX(-50%) translateY(-6px)}
+    .pulse {
+      width:54px;height:54px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+      background:rgba(255,255,255,.06);backdrop-filter:blur(4px);border:2px solid rgba(255,255,255,.08);
+      animation:pop .9s infinite alternate;
+    }
+    @keyframes pop{from{transform:scale(1)}to{transform:scale(1.08)}}
+    .roast{font-size:15px;color:#dfe;opacity:.95}
+    .small{font-size:12px;opacity:.7;margin-left:6px}
+    /* floating badge for shape */
+    .badge{position:absolute;top:12px;left:12px;background:rgba(0,0,0,.45);padding:8px 10px;border-radius:10px;font-weight:700}
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <video id="cam" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+
+    <div id="shapeBadge" class="badge">Detecting…</div>
+
+    <div id="label" class="label">
+      <div class="pulse">👀</div>
+      <div>
+        <div id="roastLine" class="roast">Waiting for face...</div>
+        <div id="subLine" class="small">Face confidence: —</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MediaPipe FaceMesh (via CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <script>
+  (async function(){
+    const video = document.getElementById('cam');
+    const canvas = document.getElementById('overlay');
+    const ctx = canvas.getContext('2d');
+    const label = document.getElementById('label');
+    const roastLine = document.getElementById('roastLine');
+    const subLine = document.getElementById('subLine');
+    const shapeBadge = document.getElementById('shapeBadge');
+
+    // --- Roast lines (non-explicit). Edit these as you wish. ---
+    const roastMap = {
+      'oval': ["Chala Jaa Bhosdike ovale face wala !👺"],
+      'round': ["aagaaya dusraa raaand biscuit jaisaa muu wala🌚"],
+      'square': ["Kyaa be lawde, jawline hone se model nahi banjayega smjha laadle🤡"],
+      'heart': ["tera muu mera gaand jaisa hai chal nikal🥀"],
+      'unknown': ["bhai boora mat maan , tera face normal face shap se different hai alien jaisa😂😂"]
+    };
+
+    // Simple helper: pick random roast
+    const pick = arr => arr[Math.floor(Math.random()*arr.length)];
+
+    // resize canvas to video element
+    function resize() {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+    }
+
+    // Heuristic classifier from FaceMesh landmarks:
+    // We'll compute ratios: jawWidth, foreheadWidth, faceLength -> compare to decide shape roughly.
+    function classifyFace(landmarks, w, h){
+      // landmarks are array of {x,y,z} normalized (0..1) relative to video
+      // pick jaw left (234), jaw right (454), chin (152), forehead-ish (10 or estimate)
+      const idx = (i)=>landmarks[i];
+      const leftJaw = idx(234), rightJaw = idx(454), chin = idx(152), forehead = idx(10);
+      // convert to pixel
+      const toPX = p => ({x: p.x * w, y: p.y * h});
+      const L = toPX(leftJaw), R = toPX(rightJaw), C = toPX(chin), F = toPX(forehead);
+
+      const jawWidth = Math.hypot(L.x-R.x, L.y-R.y);
+      const faceLength = Math.hypot(F.x-C.x, F.y-C.y);
+      // forehead width estimate ~ distance between left temple (127) and right temple (356)
+      const leftTemp = toPX(idx(127)), rightTemp = toPX(idx(356));
+      const foreheadWidth = Math.hypot(leftTemp.x-rightTemp.x, leftTemp.y-rightTemp.y);
+
+      const ratioFW = foreheadWidth / jawWidth;
+      const ratioFL = faceLength / jawWidth;
+
+      // crude rules:
+      // if faceLength relatively large -> oval
+      // if ratios close to 1 (forehead~jaw) and short length -> round
+      // if jawWidth large relative to faceLength -> square
+      // if forehead > jaw (ratioFW > 1.12) and chin narrow -> heart
+      if (ratioFL > 1.35 && ratioFW > 0.9) return 'oval';
+      if (ratioFL < 1.1 && Math.abs(ratioFW-1) < 0.12) return 'round';
+      if (ratioFW < 0.85 && ratioFL < 1.25) return 'square';
+      if (ratioFW > 1.12 && ratioFL > 1.02) return 'heart';
+      return 'unknown';
+    }
+
+    // draw animated circle around face bounding box
+    function drawFaceBox(box, t){
+      const {x,y,w,h} = box;
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      // pulse ring
+      const pulse = 0.9 + 0.08*Math.sin(t/200);
+      ctx.save();
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = `rgba(122, 170, 255, 0.95)`;
+      ctx.beginPath();
+      const cx = x + w/2, cy = y + h/2;
+      ctx.ellipse(cx, cy, w/2 * 1.08 * pulse, h/2 * 1.08 * pulse, 0, 0, Math.PI*2);
+      ctx.stroke();
+      ctx.restore();
+      // small dot at top-right
+      ctx.beginPath();
+      ctx.fillStyle = 'rgba(122,170,255,0.92)';
+      ctx.arc(x+w, y+8, 6 + 2*Math.abs(Math.sin(t/180)), 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    // compute face bounding box from landmarks
+    function landmarksToBox(landmarks, w, h){
+      let minX=1, minY=1, maxX=0, maxY=0;
+      for(const p of landmarks){
+        if(p.x < minX) minX=p.x;
+        if(p.x > maxX) maxX=p.x;
+        if(p.y < minY) minY=p.y;
+        if(p.y > maxY) maxY=p.y;
+      }
+      const x = minX * w, y = minY * h, W = (maxX-minX)*w, H = (maxY-minY)*h;
+      return {x,y,w:W,h:H};
+    }
+
+    // MediaPipe FaceMesh setup
+    const faceMesh = new FaceMesh({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+    });
+    faceMesh.setOptions({
+      maxNumFaces: 1,
+      refineLandmarks: true,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+
+    let lastT = 0;
+    faceMesh.onResults((results) => {
+      if (!video.videoWidth) return;
+      resize();
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+
+      const now = performance.now();
+      if (results.multiFaceLandmarks && results.multiFaceLandmarks.length>0){
+        const lm = results.multiFaceLandmarks[0]; // array of 468 landmarks
+        // compute box
+        const box = landmarksToBox(lm, canvas.width, canvas.height);
+        drawFaceBox(box, now);
+        // classify
+        const shape = classifyFace(lm, canvas.width, canvas.height);
+        shapeBadge.innerText = shape.toUpperCase();
+        // random roast for that shape
+        const roast = pick(roastMap[shape] || roastMap['unknown']);
+        roastLine.innerText = roast;
+        subLine.innerText = `Confidence: ${(results.multiFaceLandmarks.length? 'ok' : '—')}`;
+        label.classList.add('show');
+      } else {
+        // no face
+        shapeBadge.innerText = 'muu toh dikha bkl 🥀!';
+        roastLine.innerText = 'muu hi nahi dikhai derha hai 😂';
+        subLine.innerText = 'camera ke saamne leke aaa aand jaisa muu wala!';
+        label.classList.remove('show');
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+      }
+      lastT = now;
+    });
+
+    // start webcam via MediaPipe Camera helper
+    const camera = new Camera(video, {
+      onFrame: async () => {
+        await faceMesh.send({image: video});
+      },
+      width: 1280,
+      height: 720
+    });
+    camera.start();
+
+    // small UX: allow customizing roast text via prompt in console
+    window.setRoastText = function(shape, arr){
+      roastMap[shape] = arr;
+    };
+
+    // Example: to set an explicit custom label (non-explicit), open console and run:
+    // setRoastText('oval', ['Tu toh star hai!', 'Kya face hai boss!'])
+  })();
+  </script>
+</body>
+</html>
